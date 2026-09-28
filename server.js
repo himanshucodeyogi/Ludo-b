@@ -2,6 +2,7 @@ import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
+import { randomUUID } from 'crypto';
 
 const app = express();
 app.use(cors());
@@ -119,6 +120,7 @@ function triggerBotOrDisconnectedTurn(room) {
   if (!currentPlayer.isConnected || currentPlayer.isBot) {
     setTimeout(() => {
       if (room.currentTurnIndex !== room.players.indexOf(currentPlayer)) return;
+      if (currentPlayer.isConnected && !currentPlayer.isBot) return; // Player reconnected meanwhile
       handleDiceRoll(room.id, currentPlayer.socketId || currentPlayer.id, true);
     }, 1500);
   }
@@ -316,6 +318,38 @@ function handleTokenMove(roomId, actorId, tokenIndex, isAutomated = false) {
 }
 
 /**
+ * Returns the room for a player action, or tells the client why its action can't apply
+ * (instead of silently ignoring it and leaving the client stuck on a stale view)
+ */
+function getActionRoom(socket, roomId, callback) {
+  const room = rooms.get(roomId);
+  if (!room) {
+    if (callback) callback({ success: false, code: 'ROOM_NOT_FOUND' });
+    return null;
+  }
+  if (!room.players.some((p) => p.socketId === socket.id)) {
+    if (callback) callback({ success: false, code: 'NOT_IN_ROOM' });
+    return null;
+  }
+  return room;
+}
+
+/**
+ * Strips server-only fields (socketId, sessionToken) from a player
+ */
+function toPublicPlayer(p) {
+  return {
+    id: p.id,
+    name: p.name,
+    color: p.color,
+    isHost: p.isHost,
+    isBot: p.isBot,
+    isConnected: p.isConnected,
+    hasWon: p.hasWon
+  };
+}
+
+/**
  * Filtered room state for public broadcast
  */
 function getPublicRoomState(room) {
@@ -323,15 +357,7 @@ function getPublicRoomState(room) {
     roomId: room.id,
     maxPlayers: room.maxPlayers,
     colorScheme: room.colorScheme || ROOM_COLOR_SCHEMES[room.maxPlayers] || ROOM_COLOR_SCHEMES[4],
-    players: room.players.map((p) => ({
-      id: p.id,
-      name: p.name,
-      color: p.color,
-      isHost: p.isHost,
-      isBot: p.isBot,
-      isConnected: p.isConnected,
-      hasWon: p.hasWon
-    })),
+    players: room.players.map(toPublicPlayer),
     currentTurnColor: room.players[room.currentTurnIndex]?.color || null,
     currentTurnIndex: room.currentTurnIndex,
     diceValue: room.diceValue,
@@ -358,6 +384,7 @@ io.on('connection', (socket) => {
     const newPlayer = {
       id: socket.id,
       socketId: socket.id,
+      sessionToken: randomUUID(),
       name: playerName || 'Host Player',
       color: scheme[0], // First color (Red)
       isHost: true,
@@ -392,7 +419,9 @@ io.on('connection', (socket) => {
     socket.data.roomId = roomId;
     socket.data.playerColor = newPlayer.color;
 
-    if (callback) callback({ success: true, roomId, player: newPlayer });
+    if (callback) {
+      callback({ success: true, roomId, player: toPublicPlayer(newPlayer), sessionToken: newPlayer.sessionToken });
+    }
     io.to(roomId).emit('game_state_update', getPublicRoomState(room));
   });
 
@@ -421,6 +450,7 @@ io.on('connection', (socket) => {
     const newPlayer = {
       id: socket.id,
       socketId: socket.id,
+      sessionToken: randomUUID(),
       name: playerName || `Player ${room.players.length + 1}`,
       color: assignedColor,
       isHost: false,
@@ -434,9 +464,37 @@ io.on('connection', (socket) => {
     socket.data.roomId = normalizedId;
     socket.data.playerColor = assignedColor;
 
-    if (callback) callback({ success: true, roomId: normalizedId, player: newPlayer });
-    io.to(normalizedId).emit('player_joined', { player: newPlayer });
+    if (callback) {
+      callback({
+        success: true,
+        roomId: normalizedId,
+        player: toPublicPlayer(newPlayer),
+        sessionToken: newPlayer.sessionToken
+      });
+    }
+    io.to(normalizedId).emit('player_joined', { player: toPublicPlayer(newPlayer) });
     io.to(normalizedId).emit('game_state_update', getPublicRoomState(room));
+  });
+
+  // Rejoin Room (after a dropped connection or page refresh)
+  socket.on('rejoin_room', ({ roomId, sessionToken } = {}, callback) => {
+    const room = rooms.get(typeof roomId === 'string' ? roomId : '');
+    const player = room && sessionToken && room.players.find((p) => p.sessionToken === sessionToken);
+
+    if (!player) {
+      if (callback) callback({ success: false, message: 'Room no longer exists.' });
+      return;
+    }
+
+    player.socketId = socket.id;
+    player.isConnected = true;
+    socket.join(room.id);
+    socket.data.roomId = room.id;
+    socket.data.playerColor = player.color;
+
+    if (callback) callback({ success: true, roomId: room.id, player: toPublicPlayer(player) });
+    socket.to(room.id).emit('player_reconnected', { color: player.color, name: player.name });
+    io.to(room.id).emit('game_state_update', getPublicRoomState(room));
   });
 
   // Start Game
@@ -472,13 +530,22 @@ io.on('connection', (socket) => {
   });
 
   // Roll Dice
-  socket.on('roll_dice', ({ roomId }) => {
+  socket.on('roll_dice', ({ roomId } = {}, callback) => {
+    const room = getActionRoom(socket, roomId, callback);
+    if (!room) return;
     handleDiceRoll(roomId, socket.id);
+    // If the roll was rejected (not your turn / already rolled) the sender's view is stale: resync it
+    socket.emit('game_state_update', getPublicRoomState(room));
+    if (callback) callback({ success: true });
   });
 
   // Move Token
-  socket.on('move_token', ({ roomId, tokenIndex }) => {
+  socket.on('move_token', ({ roomId, tokenIndex } = {}, callback) => {
+    const room = getActionRoom(socket, roomId, callback);
+    if (!room) return;
     handleTokenMove(roomId, socket.id, tokenIndex);
+    socket.emit('game_state_update', getPublicRoomState(room));
+    if (callback) callback({ success: true });
   });
 
   // Reset Game / Rematch
@@ -541,10 +608,19 @@ io.on('connection', (socket) => {
   });
 });
 
+// Log unexpected errors instead of letting one bad event kill every room in memory
+process.on('uncaughtException', (err) => console.error('[Uncaught Exception]', err));
+process.on('unhandledRejection', (err) => console.error('[Unhandled Rejection]', err));
+
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', activeRooms: rooms.size });
 });
 
-server.listen(PORT, () => {
-  console.log(`🎲 Ludo 3D Multiplayer Server running on port ${PORT}`);
-});
+// On Vercel the exported server is invoked by the platform; locally we listen ourselves
+if (!process.env.VERCEL) {
+  server.listen(PORT, () => {
+    console.log(`🎲 Ludo 3D Multiplayer Server running on port ${PORT}`);
+  });
+}
+
+export default server;

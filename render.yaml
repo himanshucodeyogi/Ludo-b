@@ -1,0 +1,14 @@
+# Render Blueprint for the Ludo Socket.io backend (repo root = this backend folder, i.e. the Ludo-b repo)
+services:
+  - type: web
+    name: ludo-backend
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    # Rooms live in server memory, so there must only ever be ONE instance
+    numInstances: 1
+    envVars:
+      - key: NODE_VERSION
+        value: "22"

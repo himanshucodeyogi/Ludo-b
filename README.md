@@ -52,6 +52,7 @@ The server listens on port **4000** by default (or the `PORT` environment variab
 ### Client ➡️ Server
 - `create_room` - Creates a new game room with custom player count (2, 3, or 4)
 - `join_room` - Joins an existing room using room code
+- `rejoin_room` - Reclaims a seat after a reconnect/refresh using the `sessionToken` returned on create/join
 - `start_game` - Host starts the match
 - `roll_dice` - Requests authoritative server dice roll
 - `move_token` - Moves selected token index
@@ -63,3 +64,17 @@ The server listens on port **4000** by default (or the `PORT` environment variab
 - `dice_rolled` - Roll result, valid moves, and penalties
 - `token_moved` - Broadcasts moving token index, previousStep, newStep, and captures
 - `player_won` - Declares winner
+- `player_disconnected` / `player_reconnected` - Seat went offline (AI takes over) / came back
+
+---
+
+## ☁️ Deploying to Render
+
+Rooms and turn timers live in server memory, so the backend needs a single, always-on Node process (serverless platforms like Vercel drop connections and lose rooms). `render.yaml` in this folder is a Render Blueprint for that.
+
+1. Push this backend to its GitHub repo (the `render.yaml` must be at the repo root).
+2. In the Render dashboard: **New → Blueprint**, pick the repo, and apply. It creates the `ludo-backend` web service (`npm ci` → `npm start`, health check `/health`).
+3. Once live, open `https://<your-service>.onrender.com/health` — it should return `{"status":"healthy",...}`.
+4. In the **frontend** deployment, set `VITE_BACKEND_URL=https://<your-service>.onrender.com` and redeploy (Vite bakes it in at build time).
+
+Keep the service at **one instance**. On the free plan the service sleeps after ~15 min without traffic, so the first connection after that takes ~30-60s, and any rooms in progress are lost when it sleeps or redeploys.
